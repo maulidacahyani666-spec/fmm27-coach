@@ -1,218 +1,205 @@
 package com.fmcoach
 
 import android.app.*
-import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
-import android.graphics.PixelFormat
+import android.graphics.*
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.Build
-import android.os.Handler
-import android.os.IBinder
-import android.os.Looper
-import android.util.DisplayMetrics
-import android.view.WindowManager
-import androidx.core.app.NotificationCompat
+import android.os.*
+import android.view.*
+import android.widget.TextView
+import android.widget.Toast
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.*
-import kotlinx.coroutines.tasks.await
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
+import kotlinx.coroutines.flow.MutableStateFlow
+import java.io.File
+import kotlin.math.abs
 
+/**
+ * Satu VirtualDisplay dibuat sekali (Android 14+ melarang membuat ulang dari token yang sama),
+ * ukurannya di-resize mengikuti rotasi layar (game landscape), dan frame terbaru selalu ditahan.
+ * Tombol "FM" melayang di atas game: tekan untuk capture.
+ */
 class CaptureService : Service() {
-
     companion object {
-        const val ACTION_START = "com.fmcoach.START"
+        val running = MutableStateFlow(false)
         const val ACTION_CAPTURE = "com.fmcoach.CAPTURE"
         const val ACTION_STOP = "com.fmcoach.STOP"
-        const val EXTRA_RC = "rc"
-        const val EXTRA_DATA = "data"
-        private const val CHANNEL = "fmcoach"
-        private const val NOTIF_ID = 42
-
-        fun start(ctx: Context, resultCode: Int, data: Intent): Intent =
-            Intent(ctx, CaptureService::class.java)
-                .setAction(ACTION_START)
-                .putExtra(EXTRA_RC, resultCode)
-                .putExtra(EXTRA_DATA, data)
-
-        fun capture(ctx: Context): Intent =
-            Intent(ctx, CaptureService::class.java).setAction(ACTION_CAPTURE)
-
-        fun stop(ctx: Context): Intent =
-            Intent(ctx, CaptureService::class.java).setAction(ACTION_STOP)
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val json = Json { ignoreUnknownKeys = true }
-    private var projection: MediaProjection? = null
-    private var display: VirtualDisplay? = null
+    private val main = Handler(Looper.getMainLooper())
+    private val io = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val lock = Any()
+    private var mp: MediaProjection? = null
+    private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
-    private var capturePending = false
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START -> {
-                startForegroundCompat(buildNotification("Siap. Tekan Capture saat layar game tampil."))
-                setupProjection(intent)
-                return START_STICKY
-            }
-            ACTION_CAPTURE -> {
-                capturePending = true
-                notify("Menangkap layar...")
-                return START_STICKY
-            }
-            ACTION_STOP -> {
-                stopSelf()
-                return START_NOT_STICKY
-            }
-        }
-        return START_STICKY
+    private var size = Point(0, 0)
+    private var latest: Image? = null
+    private var overlay: TextView? = null
+    private var busy = false
+    private val mpCb = object : MediaProjection.Callback() { override fun onStop() { main.post { stopSelf() } } }
+    private val dispCb = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(id: Int) {}
+        override fun onDisplayRemoved(id: Int) {}
+        override fun onDisplayChanged(id: Int) { if (id == Display.DEFAULT_DISPLAY) ensureSize() }
     }
 
-    private fun setupProjection(intent: Intent) {
-        val rc = intent.getIntExtra(EXTRA_RC, 0)
+    override fun onBind(i: Intent?): IBinder? = null
+
+    override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+        if (i == null) { stopSelf(); return START_NOT_STICKY }
+        when (i.action) {
+            ACTION_STOP -> { stopSelf(); return START_NOT_STICKY }
+            ACTION_CAPTURE -> { if (mp == null) stopSelf() else doCapture(); return START_NOT_STICKY }
+        }
+        if (mp != null) return START_NOT_STICKY
+        startForeground(1, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         @Suppress("DEPRECATION")
-        val data = intent.getParcelableExtra(EXTRA_DATA) as? Intent ?: return
-        val mgr = getSystemService(MediaProjectionManager::class.java)
-        projection = mgr.getMediaProjection(rc, data) ?: return
+        val data: Intent? = if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra("data", Intent::class.java) else i.getParcelableExtra("data")
+        if (data == null) { stopSelf(); return START_NOT_STICKY }
+        try { setup(i.getIntExtra("code", 0), data) } catch (e: Exception) { toast("Gagal memulai: ${e.message}"); stopSelf(); return START_NOT_STICKY }
+        addOverlay()
+        running.value = true
+        return START_NOT_STICKY
+    }
 
-        projection!!.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() { stopSelf() }
-        }, Handler(Looper.getMainLooper()))
+    private fun notification(): Notification {
+        getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("cap", "Capture", NotificationManager.IMPORTANCE_LOW))
+        fun pi(a: String, rc: Int) = PendingIntent.getService(this, rc, Intent(this, CaptureService::class.java).setAction(a), PendingIntent.FLAG_IMMUTABLE)
+        return Notification.Builder(this, "cap").setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setContentTitle("FM27 Coach aktif").setContentText("Tekan tombol FM di layar game untuk capture")
+            .addAction(Notification.Action.Builder(0, "Capture", pi(ACTION_CAPTURE, 1)).build())
+            .addAction(Notification.Action.Builder(0, "Stop", pi(ACTION_STOP, 2)).build()).build()
+    }
 
-        val wm = getSystemService(WindowManager::class.java)
-        val dims = if (Build.VERSION.SDK_INT >= 30) {
-            val b = wm.currentWindowMetrics.bounds
-            b.width() to b.height()
-        } else {
-            @Suppress("DEPRECATION")
-            val m = DisplayMetrics().also { wm.defaultDisplay.getRealMetrics(it) }
-            m.widthPixels to m.heightPixels
+    @Suppress("DEPRECATION")
+    private fun realSize(): Point = Point().also { (getSystemService(DISPLAY_SERVICE) as DisplayManager).getDisplay(Display.DEFAULT_DISPLAY).getRealSize(it) }
+
+    private fun newReader(s: Point): ImageReader {
+        val r = ImageReader.newInstance(s.x, s.y, PixelFormat.RGBA_8888, 3)
+        r.setOnImageAvailableListener({ ir ->
+            val img = try { ir.acquireLatestImage() } catch (e: Exception) { null }
+            if (img != null) synchronized(lock) { latest?.close(); latest = img }
+        }, main)
+        return r
+    }
+
+    private fun setup(code: Int, data: Intent) {
+        val p = (getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager).getMediaProjection(code, data)
+        p.registerCallback(mpCb, main)
+        mp = p
+        size = realSize()
+        val r = newReader(size); reader = r
+        vd = p.createVirtualDisplay("fm27coach", size.x, size.y, resources.displayMetrics.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, null)
+        (getSystemService(DISPLAY_SERVICE) as DisplayManager).registerDisplayListener(dispCb, main)
+    }
+
+    /** Rotasi layar mengubah ukuran: resize display & ganti reader (tanpa membuat VirtualDisplay baru). */
+    private fun ensureSize() {
+        val d = vd ?: return
+        val s = realSize()
+        if (s.x == size.x && s.y == size.y) return
+        size = s
+        synchronized(lock) { latest?.close(); latest = null }
+        val old = reader
+        val r = newReader(s); reader = r
+        d.resize(s.x, s.y, resources.displayMetrics.densityDpi)
+        d.surface = r.surface
+        old?.close()
+    }
+
+    private fun addOverlay() {
+        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        val tv = TextView(this).apply {
+            text = "FM"; setTextColor(Color.WHITE); textSize = 15f; gravity = Gravity.CENTER
+            setBackgroundColor(0xCC6750A4.toInt()); setPadding(36, 28, 36, 28)
         }
-        val (w, h) = dims
-        val dpi = resources.displayMetrics.densityDpi
-
-        reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
-        display = projection!!.createVirtualDisplay(
-            "FM27Capture", w, h, dpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            reader!!.surface, null, Handler(Looper.getMainLooper())
-        )
-        reader!!.setOnImageAvailableListener({ r ->
-            if (!capturePending) { r.acquireLatestImage()?.close(); return@setOnImageAvailableListener }
-            capturePending = false
-            val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
-            val bmp = try { img.toBitmap() } catch (t: Throwable) { null } finally { img.close() }
-            if (bmp != null) processBitmap(bmp)
-            else notify("Gagal ambil frame. Coba lagi.")
-        }, Handler(Looper.getMainLooper()))
-    }
-
-    private fun Image.toBitmap(): Bitmap {
-        val buffer = planes[0].buffer
-        val pixelStride = planes[0].pixelStride
-        val rowStride = planes[0].rowStride
-        val rowPadding = rowStride - pixelStride * width
-        val bitmap = Bitmap.createBitmap(width + rowPadding / pixelStride, height, Bitmap.Config.ARGB_8888)
-        bitmap.copyPixelsFromBuffer(buffer)
-        return Bitmap.createBitmap(bitmap, 0, 0, width, height)
-    }
-
-    private fun processBitmap(bitmap: Bitmap) {
-        scope.launch {
-            try {
-                val tokens = ocr(bitmap)
-                val result = StatsParser.parse(tokens)
-                val kind = when (result) {
-                    is ParseResult.Team -> "TEAM"
-                    is ParseResult.Player -> "PLAYER"
-                    else -> "UNKNOWN"
+        val lp = WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT).apply {
+            gravity = Gravity.TOP or Gravity.START; x = 20; y = 200
+        }
+        var sx = 0f; var sy = 0f; var ox = 0; var oy = 0; var moved = false
+        tv.setOnTouchListener { v, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> { sx = e.rawX; sy = e.rawY; ox = lp.x; oy = lp.y; moved = false; true }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = (e.rawX - sx).toInt(); val dy = (e.rawY - sy).toInt()
+                    if (abs(dx) + abs(dy) > 12) moved = true
+                    lp.x = ox + dx; lp.y = oy + dy; wm.updateViewLayout(v, lp); true
                 }
-                val db = AppDatabase.get(this@CaptureService)
-                db.dao().insertCapture(
-                    Capture(
-                        timestamp = System.currentTimeMillis(),
-                        kind = kind,
-                        tokensJson = json.encodeToString(tokens),
-                    )
-                )
-                notify("Tersimpan sebagai $kind")
-            } catch (t: Throwable) {
-                notify("OCR/parse gagal: ${t.message}")
-            } finally {
-                bitmap.recycle()
+                MotionEvent.ACTION_UP -> { if (!moved) doCapture(); true }
+                else -> false
             }
         }
+        try { wm.addView(tv, lp); overlay = tv } catch (e: Exception) { toast("Tombol melayang gagal (izin 'tampil di atas app lain'?). Pakai tombol Capture di notifikasi.") }
     }
 
-    private suspend fun ocr(bitmap: Bitmap): List<TextToken> {
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-        val result = recognizer.process(InputImage.fromBitmap(bitmap, 0)).await()
-        val out = mutableListOf<TextToken>()
-        for (block in result.textBlocks) for (line in block.lines) for (el in line.elements) {
-            val b = el.boundingBox ?: continue
-            out += TextToken(el.text, b.left.toFloat(), b.top.toFloat(), b.width().toFloat(), b.height().toFloat())
+    private fun doCapture() {
+        if (busy) return
+        busy = true
+        overlay?.visibility = View.INVISIBLE      // sembunyikan tombol agar tidak ikut tertangkap
+        ensureSize()
+        main.postDelayed({
+            val bmp = synchronized(lock) { latest?.let { toBitmap(it) } }
+            overlay?.visibility = View.VISIBLE
+            if (bmp == null) { toast("Belum ada frame layar, coba lagi"); busy = false } else ocr(bmp)
+        }, 450)
+    }
+
+    private fun toBitmap(img: Image): Bitmap {
+        val pl = img.planes[0]; val w = img.width; val h = img.height
+        val b = Bitmap.createBitmap(w + (pl.rowStride - pl.pixelStride * w) / pl.pixelStride, h, Bitmap.Config.ARGB_8888)
+        pl.buffer.rewind(); b.copyPixelsFromBuffer(pl.buffer)
+        return if (b.width == w) b else Bitmap.createBitmap(b, 0, 0, w, h)
+    }
+
+    private fun ocr(bmp: Bitmap) {
+        TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS).process(InputImage.fromBitmap(bmp, 0))
+            .addOnSuccessListener { res ->
+                val toks = res.textBlocks.flatMap { it.lines }.flatMap { it.elements }
+                    .mapNotNull { e -> e.boundingBox?.let { Tok(e.text, it.centerX(), it.centerY(), it.height()) } }
+                io.launch { save(bmp, toks) }
+            }
+            .addOnFailureListener { toast("OCR gagal: ${it.message}"); busy = false }
+    }
+
+    private suspend fun save(bmp: Bitmap, toks: List<Tok>) {
+        val ts = System.currentTimeMillis()
+        val f = File(filesDir, "cap_$ts.jpg")
+        runCatching { f.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 60, it) } }
+        val kind = StatsParser.classify(toks)
+        val hd = StatsParser.header(toks)?.let { "${it[0]} ${it[1]}-${it[2]} ${it[3]}" } ?: ""
+        val dao = Db.get(this).dao()
+        dao.insertCapture(CaptureRow(ts = ts, kind = kind.name, header = hd, tokensJson = toks.toJson(), imgPath = f.absolutePath))
+        val msg = when {
+            toks.size < 8 -> "OCR hampir kosong (${toks.size} teks). Layar mungkin hitam/terblokir: buka capture di app untuk melihat gambarnya."
+            kind == Kind.UNKNOWN -> "Halaman tidak dikenali. Buka statistik tim atau statistik pemain, lalu capture lagi."
+            else -> {
+                val other = if (kind == Kind.TEAM) "PLAYER" else "TEAM"
+                if (dao.latest(other) != null) Assembler.run(dao) else "${kind.name} tersimpan. Sekarang capture halaman ${if (kind == Kind.TEAM) "statistik pemain" else "statistik tim"}."
+            }
         }
-        return out
+        toast(msg); main.post { busy = false }
     }
 
-    private fun startForegroundCompat(notif: Notification) {
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(NOTIF_ID, notif)
-        }
-    }
-
-    private fun buildNotification(text: String): Notification {
-        val nm = getSystemService(NotificationManager::class.java)
-        if (nm.getNotificationChannel(CHANNEL) == null) {
-            nm.createNotificationChannel(
-                NotificationChannel(CHANNEL, "FM27 Coach", NotificationManager.IMPORTANCE_LOW)
-            )
-        }
-        val openPi = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val capPi = PendingIntent.getService(
-            this, 1, Intent(this, CaptureService::class.java).setAction(ACTION_CAPTURE),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val stopPi = PendingIntent.getService(
-            this, 2, Intent(this, CaptureService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        return NotificationCompat.Builder(this, CHANNEL)
-            .setContentTitle("FM27 Coach")
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_camera)
-            .setOngoing(true)
-            .setContentIntent(openPi)
-            .addAction(0, "Capture", capPi)
-            .addAction(0, "Stop", stopPi)
-            .build()
-    }
-
-    private fun notify(text: String) {
-        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification(text))
-    }
+    private fun toast(s: String) { main.post { Toast.makeText(applicationContext, s, Toast.LENGTH_LONG).show() } }
 
     override fun onDestroy() {
-        try { display?.release() } catch (_: Throwable) {}
-        try { reader?.close() } catch (_: Throwable) {}
-        try { projection?.stop() } catch (_: Throwable) {}
+        running.value = false
+        overlay?.let { runCatching { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) } }
+        runCatching { (getSystemService(DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(dispCb) }
+        synchronized(lock) { latest?.close(); latest = null }
+        vd?.release(); reader?.close()
+        mp?.unregisterCallback(mpCb); mp?.stop()
+        io.cancel()
         super.onDestroy()
     }
 }

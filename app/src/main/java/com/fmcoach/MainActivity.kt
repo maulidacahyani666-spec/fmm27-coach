@@ -1,181 +1,129 @@
 package com.fmcoach
 
 import android.Manifest
-import android.app.Activity
+import android.content.Intent
+import android.graphics.BitmapFactory
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.serialization.json.Json
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
+    private val proj = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        if (r.resultCode == RESULT_OK && r.data != null)
+            startForegroundService(Intent(this, CaptureService::class.java).putExtra("code", r.resultCode).putExtra("data", r.data))
+    }
+    private val notif = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
 
-    private val projectionLauncher =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-                val i = CaptureService.start(this, result.resultCode, result.data!!)
-                startForegroundService(i)
-            }
+    private fun start() {
+        if (!Settings.canDrawOverlays(this)) {
+            Toast.makeText(this, "Aktifkan 'Tampil di atas app lain' untuk FM27 Coach, lalu tekan Mulai Capture lagi", Toast.LENGTH_LONG).show()
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            return
         }
+        proj.launch((getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager).createScreenCaptureIntent())
+    }
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerForActivityResult(ActivityResultContracts.RequestPermission()) { }.launch(
-                Manifest.permission.POST_NOTIFICATIONS
-            )
-        }
+    override fun onCreate(b: Bundle?) {
+        super.onCreate(b)
+        if (Build.VERSION.SDK_INT >= 33) notif.launch(Manifest.permission.POST_NOTIFICATIONS)
+        val dao = Db.get(this).dao()
         setContent {
             MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    AppScreen(onRequestProjection = { askProjection() })
-                }
+                val running by CaptureService.running.collectAsState()
+                Screen(dao, running, { start() }) { stopService(Intent(this, CaptureService::class.java)) }
             }
         }
     }
-
-    private fun askProjection() {
-        val mgr = getSystemService(MediaProjectionManager::class.java)
-        projectionLauncher.launch(mgr.createScreenCaptureIntent())
-    }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AppScreen(onRequestProjection: () -> Unit) {
+fun Screen(dao: AppDao, running: Boolean, onStart: () -> Unit, onStop: () -> Unit) {
     val ctx = LocalContext.current
-    val db = remember { AppDatabase.get(ctx) }
-    val dao = db.dao()
-    val captures by dao.capturesFlow().collectAsState(initial = emptyList())
-    val matches by dao.matchesFlow().collectAsState(initial = emptyList())
-    var currentReport by remember { mutableStateOf<Report?>(null) }
+    val scope = rememberCoroutineScope()
+    val prefs = remember { ctx.getSharedPreferences("p", 0) }
+    var club by remember { mutableStateOf(prefs.getString("club", "NEW") ?: "NEW") }
+    val caps by remember { dao.captures() }.collectAsState(emptyList())
+    val rows by remember { dao.matches() }.collectAsState(emptyList())
+    val canAssemble = caps.any { it.kind == "TEAM" && !it.used } && caps.any { it.kind == "PLAYER" && !it.used }
+    val ms = rows.map { it.toMatch() }
 
-    Scaffold(
-        topBar = { TopAppBar(title = { Text("FM27 Coach") }) }
-    ) { pad ->
-        Column(Modifier.padding(pad).fillMaxSize().padding(16.dp)) {
-            if (currentReport == null) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = onRequestProjection) { Text("Mulai Capture") }
-                    OutlinedButton(onClick = { ctx.startService(CaptureService.stop(ctx)) }) { Text("Stop") }
+    LazyColumn(Modifier.systemBarsPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        item { Text("FM27 Coach", style = MaterialTheme.typography.headlineMedium) }
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onStart, enabled = !running) { Text("Mulai Capture") }
+                OutlinedButton(onStop, enabled = running) { Text("Stop") }
+            }
+        }
+        item {
+            Text(
+                if (running) "Aktif. Buka game, buka halaman statistik tim lalu statistik pemain, dan tekan tombol FM di layar tiap halaman."
+                else "Belum aktif."
+            )
+        }
+        item {
+            OutlinedTextField(
+                club,
+                {
+                    club = it.uppercase().trim()
+                    prefs.edit().putString("club", club).apply()
+                },
+                label = { Text("Kode klub Anda (mis. NEW)") },
+                singleLine = true
+            )
+        }
+        item {
+            Button(
+                { scope.launch { Toast.makeText(ctx, Assembler.run(dao), Toast.LENGTH_LONG).show() } },
+                enabled = canAssemble
+            ) {
+                Text("Susun Match dari Capture terakhir")
+            }
+        }
+        Coach.patterns(ms, club).takeIf { it.isNotEmpty() }?.let { p ->
+            item {
+                Column {
+                    Text("Pola lintas match", fontWeight = FontWeight.Bold)
+                    p.forEach { Text("• $it") }
                 }
-                Spacer(Modifier.height(12.dp))
-
-                Button(
-                    onClick = {
-                        CoroutineScope(Dispatchers.IO).launch {
-                            val team = dao.lastCaptureOfKind("TEAM") ?: return@launch
-                            val player = dao.lastCaptureOfKind("PLAYER") ?: return@launch
-                            val json = Json { ignoreUnknownKeys = true }
-                            val tTokens = json.decodeFromString<List<TextToken>>(team.tokensJson)
-                            val pTokens = json.decodeFromString<List<TextToken>>(player.tokensJson)
-                            
-                            val tr = StatsParser.parse(tTokens)
-                            val pr = StatsParser.parse(pTokens)
-                            
-                            if (tr !is ParseResult.Team || pr !is ParseResult.Player) return@launch
-                            val header = tr.header ?: pr.header
-                            
-                            val md = MatchData(
-                                homeTeam = header?.homeTeam ?: "Home",
-                                awayTeam = header?.awayTeam ?: "Away",
-                                homeScore = header?.homeScore ?: 0,
-                                awayScore = header?.awayScore ?: 0,
-                                home = tr.home,
-                                away = tr.away,
-                                players = pr.players,
-                            )
-                            
-                            val all = matches.mapNotNull {
-                                runCatching { json.decodeFromString<MatchData>(it.dataJson) }.getOrNull()
-                            } + md
-                            
-                            val rep = Coach.report(md, all)
-                            dao.insertMatch(
-                                MatchEntity(
-                                    timestamp = System.currentTimeMillis(),
-                                    homeTeam = md.homeTeam,
-                                    awayTeam = md.awayTeam,
-                                    homeScore = md.homeScore,
-                                    awayScore = md.awayScore,
-                                    dataJson = json.encodeToString(MatchData.serializer(), md),
-                                )
-                            )
-                            CoroutineScope(Dispatchers.Main).launch { currentReport = rep }
-                        }
-                    },
-                    enabled = captures.any { it.kind == "TEAM" } && captures.any { it.kind == "PLAYER" }
-                ) { Text("Susun Match dari Capture terakhir") }
-
-                Spacer(Modifier.height(12.dp))
-                Text("Capture (${captures.size})", style = MaterialTheme.typography.titleMedium)
-                LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
-                    items(captures) { c ->
-                        Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                            Column(Modifier.padding(8.dp)) {
-                                Text("${c.kind} — ${c.timestamp}")
-                            }
-                        }
+            }
+        }
+        item { Text("Capture (${caps.size})", style = MaterialTheme.typography.titleMedium) }
+        items(caps, key = { it.id }) { c -> CaptureCard(c) { scope.launch { dao.deleteCapture(c.id) } } }
+        item { Text("Match tersimpan (${rows.size})", style = MaterialTheme.typography.titleMedium) }
+        items(rows, key = { it.id }) { r ->
+            val m = r.toMatch()
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("${m.home} ${m.hg}-${m.ag} ${m.away}", fontWeight = FontWeight.Bold)
+                    Coach.report(m, club).forEach { f ->
+                        Text((if (f.good) "✅ " else "⚠️ ") + f.title, fontWeight = FontWeight.Medium)
+                        if (f.cause.isNotEmpty()) Text(f.cause, style = MaterialTheme.typography.bodySmall)
+                        if (f.fix.isNotEmpty()) Text("→ ${f.fix}")
                     }
-                }
-
-                Text("Match tersimpan (${matches.size})", style = MaterialTheme.typography.titleMedium)
-                LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
-                    items(matches) { m ->
-                        Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                            Row(
-                                Modifier.padding(8.dp).fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Column(Modifier.weight(1f)) {
-                                    Text("${m.homeTeam} ${m.homeScore}-${m.awayScore} ${m.awayTeam}")
-                                }
-                                Button(onClick = {
-                                    val json = Json { ignoreUnknownKeys = true }
-                                    val md = runCatching {
-                                        json.decodeFromString<MatchData>(m.dataJson)
-                                    }.getOrNull() ?: return@Button
-                                    val all = matches.mapNotNull {
-                                        runCatching { json.decodeFromString<MatchData>(it.dataJson) }.getOrNull()
-                                    }
-                                    currentReport = Coach.report(md, all)
-                                }) { Text("Laporan") }
-                            }
-                        }
-                    }
-                }
-            } else {
-                val rep = currentReport!!
-                Button(onClick = { currentReport = null }) { Text("← Kembali") }
-                Spacer(Modifier.height(8.dp))
-                LazyColumn {
-                    item {
-                        Text(
-                            "${rep.match.homeTeam} ${rep.match.homeScore}-${rep.match.awayScore} ${rep.match.awayTeam}",
-                            style = MaterialTheme.typography.titleLarge
-                        )
-                        Spacer(Modifier.height(8.dp))
-                    }
-                    if (rep.patterns.isNotEmpty()) {
-                        item { Text("Pola lintas match", style = MaterialTheme.typography.titleMedium) }
-                        items(rep.patterns) { f -> FindingCard(f) }
-                    }
-                    item { Text("Temuan match ini", style = MaterialTheme.typography.titleMedium) }
-                    items(rep.findings) { f -> FindingCard(f) }
+                    TextButton({ scope.launch { dao.deleteMatch(r.id) } }) { Text("Hapus match") }
                 }
             }
         }
@@ -183,12 +131,40 @@ private fun AppScreen(onRequestProjection: () -> Unit) {
 }
 
 @Composable
-private fun FindingCard(f: Finding) {
-    Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-        Column(Modifier.padding(10.dp)) {
-            Text("Temuan: ${f.temuan}", style = MaterialTheme.typography.titleSmall)
-            Text("Penyebab: ${f.penyebab}")
-            Text("Solusi: ${f.solusi}")
+fun CaptureCard(c: CaptureRow, onDelete: () -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    val fmt = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
+    val ocrText = remember(c.id) { c.toks().joinToString(" ") { it.text } }
+    val findings = remember(c.id, ocrText) {
+        if (c.kind == "UNKNOWN" || c.kind == "TEAM" || c.kind == "PLAYER") {
+            // Always try free-text analysis so panel analisis / mixed screens look clean
+            Coach.findingsFromOcrText(ocrText)
+        } else emptyList()
+    }
+
+    Card(Modifier.fillMaxWidth().clickable { open = !open }) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("${c.kind}${if (c.used) " ✓" else ""} · ${fmt.format(Date(c.ts))} · ${c.header}")
+            if (open) {
+                val bmp = remember(c.imgPath) { BitmapFactory.decodeFile(c.imgPath)?.asImageBitmap() }
+                if (bmp != null) Image(bmp, null, Modifier.fillMaxWidth())
+
+                if (findings.isNotEmpty()) {
+                    // Structured findings – same style as Match cards
+                    findings.forEach { f ->
+                        Text((if (f.good) "✅ " else "⚠️ ") + f.title, fontWeight = FontWeight.Medium)
+                        if (f.cause.isNotEmpty()) Text(f.cause, style = MaterialTheme.typography.bodySmall)
+                        if (f.fix.isNotEmpty()) Text("→ ${f.fix}")
+                    }
+                } else {
+                    // Fallback only when nothing could be extracted
+                    Text(
+                        "Teks OCR: " + ocrText.take(700),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                TextButton(onDelete) { Text("Hapus capture") }
+            }
         }
     }
 }

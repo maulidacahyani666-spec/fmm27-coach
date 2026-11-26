@@ -1,179 +1,103 @@
 package com.fmcoach
 
 import kotlin.math.abs
+import kotlin.math.max
 
-sealed class ParseResult {
-    data class Team(val header: Header?, val home: TeamStats, val away: TeamStats) : ParseResult()
-    data class Player(val header: Header?, val players: List<PlayerStat>) : ParseResult()
-    data class Unknown(val header: Header?) : ParseResult()
-}
+enum class Kind { TEAM, PLAYER, UNKNOWN }
 
-data class Header(val homeTeam: String, val awayTeam: String, val homeScore: Int, val awayScore: Int)
-
+/** Mengubah token OCR (teks + posisi) dari layar laporan FM27 Mobile (bahasa Indonesia) menjadi data. */
 object StatsParser {
+    private val NUM = Regex("""^\d+([.,]\d+)?%?$""")
+    private val POS = setOf("GK", "DR", "DL", "DC", "DMC", "DMR", "DML", "WBR", "WBL", "MC", "MR", "ML", "AMC", "AMR", "AML", "FC", "ST")
 
-    private val labelMap = mapOf(
-        "nilai tim" to "rating",
-        "penguasaan" to "poss",
-        "tembakan" to "shots",
-        "tembakan tepat sasaran" to "sot",
-        "xg" to "xg",
-        "umpan sukses" to "pc",
-        "umpan dicoba" to "pa",
-        "umpan silang berhasil" to "crc",
-        "percobaan umpan silang" to "cra",
-        "pelanggaran" to "fouls",
-        "tekel berhasil" to "tkw",
-        "sundulan berhasil" to "hdw",
-    )
+    fun num(s: String): Double? = if (NUM.matches(s)) s.replace(",", ".").removeSuffix("%").toDouble() else null
+    private fun numStat(s: String): Int? = num(s)?.toInt() ?: if (s == "O" || s == "o") 0 else null
 
-    fun parse(tokens: List<TextToken>): ParseResult {
-        val header = parseHeader(tokens)
-        val players = parsePlayers(tokens)
-        if (players.size >= 5) return ParseResult.Player(header, players)
-        
-        val teamStats = parseTeamStats(tokens)
-        if (teamStats != null) return ParseResult.Team(header, teamStats.first, teamStats.second)
-        
-        return ParseResult.Unknown(header)
+    private fun keyFor(l: String): String? {
+        val s = l.lowercase()
+        return when {
+            "silang" in s && "berhasil" in s -> "crc"
+            "silang" in s -> "cra"
+            "tepat" in s -> "sot"
+            "tembakan" in s -> "shots"
+            "xg" in s -> "xg"
+            "penguasaan" in s -> "poss"
+            "sukses" in s -> "pc"
+            "dicoba" in s -> "pa"
+            "nilai" in s -> "rating"
+            "pelanggaran" in s -> "fouls"
+            "tekel" in s -> "tkw"
+            "sundulan" in s -> "hdw"
+            else -> null
+        }
     }
 
-    private fun parseHeader(tokens: List<TextToken>): Header? {
-        val lines = clusterLines(tokens)
-        for (line in lines) {
-            val texts = line.map { it.text }
-            val ftIdx = texts.indexOfFirst { it.equals("FT", true) }
-            if (ftIdx < 0) continue
-            
-            val numericIdx = texts.indices.filter { i -> i > ftIdx && texts[i].toIntOrNull() != null }
-            if (numericIdx.size < 2) continue
-            
-            val hs = texts[numericIdx[0]].toInt()
-            val as_ = texts[numericIdx[1]].toInt()
-            
-            val home = texts.subList(ftIdx + 1, numericIdx[0]).joinToString(" ").trim()
-            val away = texts.subList(numericIdx[1] + 1, texts.size).joinToString(" ").trim()
-            
-            if (home.isNotEmpty() && away.isNotEmpty()) {
-                return Header(home, away, hs, as_)
+    fun rows(toks: List<Tok>): List<List<Tok>> {
+        if (toks.isEmpty()) return emptyList()
+        val hs = toks.map { it.h }.sorted()
+        val tol = max(10.0, hs[hs.size / 2] * 0.7)
+        val out = mutableListOf<MutableList<Tok>>()
+        for (t in toks.sortedBy { it.y }) {
+            val r = out.lastOrNull()
+            if (r != null && abs(t.y - r.first().y) <= tol) r.add(t) else out.add(mutableListOf(t))
+        }
+        return out.map { r -> r.sortedBy { it.x } }
+    }
+
+    fun classify(toks: List<Tok>): Kind {
+        if (toks.isEmpty()) return Kind.UNKNOWN
+        val txt = toks.joinToString(" ") { it.text.lowercase() }
+        val hits = listOf("penguasaan", "nilai tim", "tembakan", "umpan sukses", "umpan dicoba", "tekel berhasil", "sundulan", "pelanggaran", "xg").count { it in txt }
+        if (hits >= 2 || team(toks).size >= 4) return Kind.TEAM
+        val hdr = listOf("paa", "pac", "taa", "hea", "cra", "sha", "kon").count { h -> toks.any { it.text.lowercase().startsWith(h) } }
+        if (hdr >= 3 || players(toks).size >= 5) return Kind.PLAYER
+        // Panel analisis / papan taktik sering memuat kata-kata ini
+        val analysisHits = listOf("formasi", "penampilan terbaik", "negatif", "gaya", "pertahanan", "lini tengah").count { it in txt }
+        if (analysisHits >= 2) return Kind.TEAM   // treat as useful capture, not pure UNKNOWN
+        return Kind.UNKNOWN
+    }
+
+    /** [home, hg, ag, away] dari bar atas, mis. "FT CRY 2 3 NEW". */
+    fun header(toks: List<Tok>): List<String>? {
+        val line = rows(toks).take(2).joinToString(" ") { r -> r.joinToString(" ") { it.text } }
+        val m = Regex("""([A-Z]{2,4})\s+(\d+)\D+(\d+)\s+([A-Z]{2,4})""").find(line) ?: return null
+        return listOf(m.groupValues[1], m.groupValues[2], m.groupValues[3], m.groupValues[4])
+    }
+
+    /** Kiri = tuan rumah, kanan = tamu. */
+    fun team(toks: List<Tok>): Map<String, Pair<Double, Double>> {
+        val out = linkedMapOf<String, Pair<Double, Double>>()
+        for (r in rows(toks)) {
+            val d = ArrayList<Double>(); val s = ArrayList<String>(); var lb = ""
+            for (t in r) {
+                val n = num(t.text)
+                if (n == null) lb = "$lb ${t.text}".trim()
+                else { if (lb.isNotEmpty()) { s.add(lb); lb = "" }; d.add(n) }
+            }
+            if (lb.isNotEmpty()) s.add(lb)
+            val k = s.map { keyFor(it) }
+            when {
+                s.size == 2 && d.size == 4 && k.all { it != null } -> { out[k[0]!!] = d[0] to d[1]; out[k[1]!!] = d[2] to d[3] }
+                s.size == 1 && d.size == 2 && k[0] != null -> out[k[0]!!] = d[0] to d[1]
+                d.size == 8 && k.none { it != null } -> { out["yc"] = d[0] to d[1]; out["rc"] = d[2] to d[3]; out["off"] = d[4] to d[5]; out["cor"] = d[6] to d[7] }
             }
         }
-        return null
+        return out
     }
 
-    fun parseTeamStats(tokens: List<TextToken>): Pair<TeamStats, TeamStats>? {
-        if (tokens.isEmpty()) return null
-        val tolY = tokens.map { it.h }.maxOrNull()?.times(1.2f) ?: 20f
-
-        fun cleanDouble(text: String): Double? {
-            return text.replace("%", "").replace(",", ".").toDoubleOrNull()
+    fun players(toks: List<Tok>): List<PlayerLine> {
+        val statX = toks.firstOrNull { it.text.equals("PaA", true) }?.x?.minus(30)
+        return rows(toks).mapNotNull { r ->
+            val raw = r.first().text.uppercase().trim('.')
+            val pos = if (raw.matches(Regex("S\\d+"))) "SUB" else raw
+            if (pos != "SUB" && pos !in POS) return@mapNotNull null
+            val rest = r.drop(1)
+            val nameT = if (statX != null) rest.filter { it.x < statX } else rest.takeWhile { num(it.text) == null }
+            val statT = if (statX != null) rest.filter { it.x >= statX } else rest.dropWhile { num(it.text) == null }
+            var nums = statT.mapNotNull { numStat(it.text) }
+            if (nums.size > 18) nums = nums.take(16) + nums.takeLast(2)   // ikon bola/kartu terbaca sebagai angka
+            if (nums.size < 18) null
+            else PlayerLine(pos, nameT.filter { t -> t.text.any { it.isLetter() } }.joinToString(" ") { it.text }, nums)
         }
-
-        fun nearestLeft(label: TextToken): Double? {
-            val token = tokens.filter {
-                it !== label && abs(it.y - label.y) <= tolY && it.x + it.w <= label.x + 2f
-            }.maxByOrNull { it.x }
-            return token?.let { cleanDouble(it.text) }
-        }
-
-        fun nearestRight(label: TextToken): Double? {
-            val token = tokens.filter {
-                it !== label && abs(it.y - label.y) <= tolY && it.x >= label.x + label.w - 2f
-            }.minByOrNull { it.x }
-            return token?.let { cleanDouble(it.text) }
-        }
-
-        var found = 0
-        val homeBuilder = TeamStatsBuilder()
-        val awayBuilder = TeamStatsBuilder()
-
-        for (t in tokens) {
-            val key = labelMap[t.text.lowercase().trim()] ?: continue
-            val lv = nearestLeft(t)
-            val rv = nearestRight(t)
-            if (lv == null && rv == null) continue
-            homeBuilder.set(key, lv)
-            awayBuilder.set(key, rv)
-            found++
-        }
-        
-        if (found < 3) return null
-
-        val lines = clusterLines(tokens)
-        val numericLines = lines.filter { line ->
-            if (line.size < 2) return@filter false
-            cleanDouble(line.first().text) != null && cleanDouble(line.last().text) != null
-        }
-        
-        if (numericLines.size >= 4) {
-            val iconLines = numericLines.takeLast(4)
-            val iconKeys = listOf("yc", "rc", "off", "cor")
-            for (i in 0 until 4) {
-                val line = iconLines[i]
-                val lv = cleanDouble(line.first().text)
-                val rv = cleanDouble(line.last().text)
-                homeBuilder.set(iconKeys[i], lv)
-                awayBuilder.set(iconKeys[i], rv)
-            }
-        }
-
-        return homeBuilder.build() to awayBuilder.build()
-    }
-
-    private class TeamStatsBuilder {
-        private val m = mutableMapOf<String, Double?>()
-        fun set(key: String, v: Double?) { m[key] = v }
-        fun build(): TeamStats = TeamStats(
-            rating = m["rating"], poss = m["poss"],
-            shots = m["shots"]?.toInt(), sot = m["sot"]?.toInt(),
-            xg = m["xg"], pc = m["pc"]?.toInt(), pa = m["pa"]?.toInt(),
-            crc = m["crc"]?.toInt(), cra = m["cra"]?.toInt(),
-            fouls = m["fouls"]?.toInt(), tkw = m["tkw"]?.toInt(), hdw = m["hdw"]?.toInt(),
-            yc = m["yc"]?.toInt(), rc = m["rc"]?.toInt(),
-            off = m["off"]?.toInt(), cor = m["cor"]?.toInt(),
-        )
-    }
-
-    fun parsePlayers(tokens: List<TextToken>): List<PlayerStat> {
-        val lines = clusterLines(tokens)
-        return lines.mapNotNull { parsePlayerLine(it) }
-    }
-
-    private fun parsePlayerLine(line: List<TextToken>): PlayerStat? {
-        if (line.size < 19) return null 
-        
-        val pos = line.first().text
-        if (pos.matches(Regex("S\\d+", RegexOption.IGNORE_CASE))) return null 
-        
-        val statsTokens = line.takeLast(18)
-        val nums = statsTokens.map { it.text.replace(",", ".").toDoubleOrNull() }
-        if (nums.any { it == null }) return null 
-        
-        val name = line.subList(1, line.size - 18).joinToString(" ") { it.text }.trim()
-        if (name.isEmpty() || name == "-") return null
-        
-        return PlayerStat(
-            pos = pos, name = name,
-            paA = nums[0], paC = nums[1], key = nums[2], ass = nums[3],
-            taA = nums[4], taW = nums[5], int = nums[6],
-            heA = nums[7], heW = nums[8],
-            crA = nums[9], crC = nums[10], dri = nums[11],
-            dispossessed = nums[12], mistakeGoal = nums[13],
-            shA = nums[14], shO = nums[15],
-            kon = nums[16], rating = nums[17],
-        )
-    }
-
-    fun clusterLines(tokens: List<TextToken>): List<List<TextToken>> {
-        if (tokens.isEmpty()) return emptyList()
-        val tol = tokens.map { it.h }.maxOrNull()?.times(0.6f) ?: 10f
-        val sorted = tokens.sortedBy { it.y }
-        val lines = mutableListOf<MutableList<TextToken>>()
-        for (t in sorted) {
-            val cur = lines.lastOrNull()
-            if (cur != null && abs(cur.first().y - t.y) <= tol) cur.add(t)
-            else lines.add(mutableListOf(t))
-        }
-        return lines.map { it.sortedBy { tk -> tk.x } }
     }
 }
